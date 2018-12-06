@@ -2,32 +2,27 @@
 #include <PubSubClient.h>
 #include <ESP8266WebServer.h>
 #include "hw_timer.h"
-#include "OneButton.h"
 #include "html_pages.h"
 
 // WIFI SETTINGS
-const char* ssid = "SSID";
-const char* password = "PASSWORD";
+const char* ssid = "TP-Link_89B4";
+const char* password = "saxena@54321";
 
 // MQTT Settings
-const char* mqtt_server = "";
+const char* mqtt_server = "192.168.0.111";
 const int mqtt_port = 1883;
-const char* mqtt_user = "";
-const char* mqtt_password = "";
-const char* mqtt_state_topic = "office/light1/state";
-const char* mqtt_brightness_topic = "office/light1/brightness";
-const char* mqtt_fade_topic = "office/light1/fade";
-const char* pir_state_topic = "office/light1/motion";
+const char* mqtt_user = "openhabian";
+const char* mqtt_password = "openhabian";
+const char* mqtt_state_topic = "wemos/dimmer/state";
+const char* mqtt_brightness_topic = "wemos/dimmer/brightness";
+const char* mqtt_fade_topic = "wemos/dimmer/fade";
+const char* pir_state_topic = "wemos/pir";
 
 // PIN SETTINGS
 const byte switchPin = 5;
 const byte zcPin = 12;
 const byte outPin = 13;
 const byte pirPin = 0;
-
-// BUTTON SETTINGS
-const byte buttonType = 1; // 0 = toggle; 1 = momentary;
-const byte buttonActiveOn = 0; // 0 = high; 1 = low;
 
 // OTHER SETTINGS
 const byte mqttDebug = 1;
@@ -41,13 +36,15 @@ byte zcState = 0; // 0 = ready; 1 = processing;
 ESP8266WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
-OneButton button(switchPin, buttonActiveOn);
 
 void setup(void) {
   pinMode(zcPin, INPUT_PULLUP);
   pinMode(switchPin, INPUT_PULLUP);
   pinMode(outPin, OUTPUT);
-  if (pirPin) pinMode(pirPin, INPUT_PULLUP);
+  //if (pirPin) 
+  //pinMode(pirPin, INPUT_PULLUP); //From original code. Didn't work for my variant of code.
+  pinMode(pirPin, INPUT);
+  digitalWrite(pirPin, LOW);
 
   digitalWrite(outPin, 0);
   
@@ -152,21 +149,12 @@ void setup(void) {
   Serial.println("HTTP server: Started");
   
   setupMQTTClient();
-  
-  switch (buttonType) {
-    case 0:  // toggle switch
-      attachInterrupt(switchPin, toggleSwitchDetect, CHANGE);
-      break;
-    case 1:  // momentary 
-      button.attachDuringLongPress(longPressTick, 10);
-      button.attachPatternEnd(clickPatternEnd);
-      break;
-  }
 
   hw_timer_init(NMI_SOURCE, 0);
   hw_timer_set_func(dimTimerISR);
   
-  if (pirPin) attachInterrupt(pirPin, pirDetect, CHANGE);
+  //if (pirPin) 
+  //attachInterrupt(pirPin, pirDetect, CHANGE);  //implemented PIR in loop instead of interrupt
   attachInterrupt(zcPin, zcDetectISR, RISING);
 }
   
@@ -225,22 +213,97 @@ void setupMQTTClient() {
   }
 }
 
+//MQTT Reconnection code
+long lastReconnectAttempt = 0;
+
+boolean reconnect() {
+  Serial.print("MQTT connection lost. Reconnecting...");
+  setupMQTTClient();
+  return mqttClient.connected();
+} 
 
 void loop(void)
-{
-  // handle button:
-  button.tick();
-    
+{ 
   // handle http:
   server.handleClient();
    
   // handle MQTT:
-  //if (mqttClient.connected()) {
+  if (mqttClient.connected()) {
     mqttClient.loop();
-  //}
-  //else {
-    // TODO: reconnect logic
-  //}
+  }
+  else {
+    long now = millis();
+    if (now - lastReconnectAttempt > 5000) {
+      lastReconnectAttempt = now;
+      // Attempt to reconnect
+      if (reconnect()) {
+        lastReconnectAttempt = 0;
+      }
+    }
+  }
+  
+  // handle WiFi
+  if ( WiFi.status() == WL_DISCONNECTED )
+  {
+    Serial.print("\nWiFi connection lost. Reconnecting ");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\nReconnected to WiFi: ");
+  Serial.println(WiFi.localIP());
+  }  
+
+   pirSensor();
+}
+
+// handling PIR
+
+unsigned long previousMillis = 0;
+const long interval = 10000;
+int pirState = LOW;
+boolean lockLow = true;
+boolean takeLowTime;
+long unsigned int lowIn;
+
+void pirSensor()
+{
+  unsigned long currentMillis = millis();
+  if (mqttClient.connected()) {
+  if (digitalRead(pirPin) == HIGH) {
+    if(lockLow){
+    if(pirState == LOW)
+    {
+      Serial.print('R');
+      mqttClient.publish(pir_state_topic, "ON");
+      pirState = HIGH;
+    }
+    lockLow = false;
+    delay(50);
+  }
+  takeLowTime = true;
+  }
+  if(digitalRead(pirPin) == LOW)
+  {
+      if(takeLowTime)
+      {
+        lowIn = millis();
+        takeLowTime = false;
+      }
+      if(!lockLow && millis() - lowIn > interval)
+      {
+        if (pirState == HIGH)
+        {
+          Serial.print('F');
+          mqttClient.publish(pir_state_topic, "OFF");
+          pirState = LOW;
+        }
+        lockLow = true;
+        delay(50);
+     }
+   }   
+}
 }
 
 void updateState(bool newState) {
@@ -294,56 +357,20 @@ void updateBrightness(int newBrightness) {
   }
 }
 
-
-void clickPatternEnd() {
-  if (button.getPattern() == "C") {
-    updateState(!state);
-  }
-  else if (button.getPattern() == "CCC") {
-    updateFade(!fade);
-  }
-  else if (button.getPattern() == "L" || button.getPattern() == "CL") {
-    updateBrightness(tarBrightness);
-  }
-}
-
-
-void longPressTick() {
-  if (button.getPattern() == "L") {
-    state = 1;
-    if (tarBrightness < 255) { ++tarBrightness; }
-  }
-  else if (button.getPattern() == "CL") {
-    if (state = 1) {
-      if (tarBrightness > 0) { --tarBrightness; }
-    }
-  }
-}
-
-void toggleSwitchDetect() {
-  static byte toggleButtonState = 0;
-  
-  if (toggleButtonState == 0) {
-    toggleButtonState = 1;
-    updateState(!state);
-  
-    delay(20); // debounce
-    toggleButtonState = 0;
-  }
-}
-
-void pirDetect() {
+//Original code part to implement PIR as interrupt
+/*void pirDetect() {
   if (mqttClient.connected()) {
     if (digitalRead(pirPin)) {
       Serial.print('R');
       mqttClient.publish(pir_state_topic, "ON");
+      
     }
     else {
-      Serial.print('F');
-      mqttClient.publish(pir_state_topic, "OFF");
+        Serial.print('F');
+        mqttClient.publish(pir_state_topic, "OFF");
     }
   }
-}
+}*/
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   char c_payload[length];
@@ -391,8 +418,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 
-
-
 void dimTimerISR() {
     if (fade == 1) {
       if (curBrightness > tarBrightness || (state == 0 && curBrightness > 0)) {
@@ -433,7 +458,7 @@ void zcDetectISR() {
     if (curBrightness < 255 && curBrightness > 0) {
       digitalWrite(outPin, 0);
       
-      int dimDelay = 30 * (255 - curBrightness) + 400;
+      int dimDelay = 37 * (255 - curBrightness) + 500;
       hw_timer_arm(dimDelay);
     }
   }
